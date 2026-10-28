@@ -426,8 +426,10 @@ export class CodexTranscriptInput extends BaseInput {
     if (cached && await this.rolloutDirsUnchanged(cached.dirMtimes)) return cached.files;
     const files: string[] = [];
     const dirMtimes = new Map<string, number>();
-    await collectRolloutFiles(this.sessionDir, files, dirMtimes);
-    this.cachedDefaultRollout = dirMtimes.size > 0 ? { dirMtimes, files } : null;
+    const complete = await collectRolloutFiles(this.sessionDir, files, dirMtimes, (dir, error) => {
+      this.logger.warn('Codex rollout directory scan failed; retrying next poll', { dir, error: String(error) });
+    });
+    this.cachedDefaultRollout = complete && dirMtimes.size > 0 ? { dirMtimes, files } : null;
     return files;
   }
 
@@ -2442,28 +2444,31 @@ async function collectRolloutFiles(
   dir: string,
   files: string[],
   dirMtimes?: Map<string, number>,
-): Promise<void> {
+  onError?: (dir: string, error: unknown) => void,
+): Promise<boolean> {
   let entries: Dirent[];
   try {
+    // Snapshot before readdir: a producer may publish a rollout (or a dated
+    // subdirectory) after readdir took its listing. Recording the later mtime
+    // would cache that stale listing indefinitely, missing all new turns.
+    // With the earlier mtime, the next poll invalidates and rescans it.
+    const mtime = dirMtimes ? (await fs.stat(dir)).mtimeMs : undefined;
     entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
+    if (dirMtimes && mtime !== undefined) dirMtimes.set(dir, mtime);
+  } catch (error) {
+    onError?.(dir, error);
+    return false;
   }
-  if (dirMtimes) {
-    try {
-      dirMtimes.set(dir, (await fs.stat(dir)).mtimeMs);
-    } catch {
-      return;
-    }
-  }
+  let complete = true;
   for (const entry of entries) {
     const entryPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      await collectRolloutFiles(entryPath, files, dirMtimes);
+      if (!await collectRolloutFiles(entryPath, files, dirMtimes, onError)) complete = false;
     } else if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
       files.push(entryPath);
     }
   }
+  return complete;
 }
 
 async function collectRecentRolloutFiles(
