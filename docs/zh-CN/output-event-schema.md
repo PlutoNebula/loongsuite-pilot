@@ -14,7 +14,10 @@ Hermes 在 `pre_api_request` 中为本次 API 请求分配固定的 `span_id`，
 不会重复写出已经成功追加的事件。没有响应的请求保留请求记录，不合成成功响应。
 新版 lazy-forward streaming helper 与旧版方法签名均支持 TTFT 观测。
 
-增量 Hermes 事件携带 `agent.hermes.collection=realtime-v1`；回合结束记录为
+增量 Hermes 事件携带 `agent.hermes.collection=realtime-v1`。首条 `llm.request`
+落盘前会先追加一次 `event.name=other`、`agent.hermes.hook=turn_start` 的用户输入事件，
+用于逐轮上游 Trace 关联；它使用已确定的原生 turn/task ID，不参与 Token 统计，
+并与首个 API 请求共用观测到的请求起始时间。回合结束记录为
 `event.name=other`、`agent.hermes.hook=turn_end`、`gen_ai.turn.end=true`。
 collector 以该标记结束 trace 聚合，避免重试中的 error/stop 或同会话并发回合提前截断 trace。
 旧版插件事件仍沿用原有结束判定。源 JSONL 追加不等待 collector 生成完整 trace 或上报完成。
@@ -240,3 +243,7 @@ Claude Code、Qoder、Codex、OpenCode、Pi Coding Agent、DeepSeek Harness、Mi
 | `end_turn` | 模型结束当前轮次。 |
 | `cancelled` | 用户中断生成，不表示 Provider 或 Agent 错误。 |
 | `error` | 单次物理模型请求失败。对 Claude Code，中间的 `error` 不结束 turn；最终失败还会带 `gen_ai.turn.end=true`。 |
+
+### 逐轮关联原文 hash
+
+Hermes 的用户输入 `other` 事件可携带 `agent.pilot.correlation.content_hash`：用户原文 UTF-8 的 SHA-256 前 16 位十六进制字符，与关联文件的 `contentHash` 相同。该值在正文截断前计算，使超长输入在仅提供 hash 时仍可关联；旧生产者不提供此字段时，Pilot 继续按采集正文计算 hash / 匹配前缀。它不替代对消息结构计算的 `gen_ai.input.messages_hash`。
