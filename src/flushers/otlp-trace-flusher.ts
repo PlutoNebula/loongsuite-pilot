@@ -18,6 +18,7 @@ import {
 import { convertDelegatedTurn } from './delegated-turn-converter.js';
 import { convertCodexTurn } from './codex-turn-converter.js';
 import { isAgentAuditEvent, prepareTraceEvents } from './trace-event-compat.js';
+import { convertDoubaoWorkTurn, enrichDoubaoClientRequest } from './doubao-work-converter.js';
 import { CodexTurnJournal, codexTurnJournalGroupKey } from './codex-turn-journal.js';
 import { convertQwenSubagents } from './qwen-subagent-converter.js';
 import { createReadableSpanToOtlpSpanJsonArray } from './otlp-json-serializer.js';
@@ -742,7 +743,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
     if (isAgentAuditEvent(entry)) return;
     // Session summaries are log events, never an extra or reopened trace.
     if (entry['gen_ai.agent.type'] === 'copilot' && entry['gen_ai.copilot.session_summary'] === true) return;
-
+    if (entry['gen_ai.agent.type'] === 'doubao-work' && entry['loongsuite.doubao_work.trace_role'] === 'log_only') return;
     const { source, value, key } = this.resolveGroupKey(entry);
     const agentType = normalizeAgentType(
       (entry['gen_ai.agent.type'] as string) ?? '',
@@ -781,7 +782,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
     for (const [bufKey, buf] of this.turnBuffers) {
       // Native Codex task_complete/turn_aborted is authoritative. A second
       // work item in the same thread must not truncate a still-running turn.
-      if (agentType === 'codex') break;
+      if (agentType === 'codex' || agentType === 'doubao-work') break;
       if (buf.agentType !== agentType || bufKey === key || buf.completed) continue;
       // Incremental Hermes turns may overlap inside one IM session. They have
       // their own explicit completion, so a successor is not an implicit end.
@@ -1010,6 +1011,14 @@ export class OtlpTraceFlusher extends BaseFlusher {
       && entry['agent.opencode.collection'] === 'v2') {
       return entry['gen_ai.turn.end'] === true;
     }
+    // The passive Doubao adapter observes client message completion, not a
+    // model finish reason. Only its explicit terminal boundary closes the turn.
+    if (normalizeAgentType(String(entry['gen_ai.agent.type'] ?? '')) === 'doubao-work') {
+      if (entry['loongsuite.doubao_work.observation_scope'] === 'native_sandbox_execution') {
+        return entry['event.name'] === 'other' && entry['loongsuite.doubao_work.local_execution_phase'] === 'end';
+      }
+      return entry['event.name'] === 'other' && entry['gen_ai.turn.end'] === true;
+    }
     // Incremental Hermes producers emit errors/stop per API invocation. Only
     // their explicit lifecycle marker closes a turn (which may retry or run
     // tools after a model completion). Keep old installed producers compatible.
@@ -1072,6 +1081,17 @@ export class OtlpTraceFlusher extends BaseFlusher {
     value: string;
     key: string;
   } {
+    const localExecution = entry['loongsuite.doubao_work.native_execution_id'];
+    if (entry['gen_ai.agent.type'] === 'doubao-work' && entry['loongsuite.doubao_work.observation_scope'] === 'native_sandbox_execution'
+      && typeof localExecution === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(localExecution)) {
+      return { source: 'turn_id', value: localExecution, key: `doubao-local-execution:${localExecution}` };
+    }
+    const traceId = entry['trace_id'] as string | undefined;
+    // The client can reuse chat_session_id. The producer trace identity also
+    // includes queryMs, conversation and source scope; preserve that identity.
+    if (entry['gen_ai.agent.type'] === 'doubao-work' && traceId && VALID_TRACE_ID_RE.test(traceId)) {
+      return { source: 'trace_id', value: traceId, key: `doubao-request:${traceId}` };
+    }
     const turnId = entry['gen_ai.turn.id'] as string | undefined;
     if (turnId && turnId.length > 0) {
       if (normalizeAgentType(String(entry['gen_ai.agent.type'] ?? '')) === 'codex') {
@@ -1082,7 +1102,6 @@ export class OtlpTraceFlusher extends BaseFlusher {
       return { source: 'turn_id', value: turnId, key: `turn:${turnId}` };
     }
 
-    const traceId = entry['trace_id'] as string | undefined;
     if (traceId && VALID_TRACE_ID_RE.test(traceId)) {
       return { source: 'trace_id', value: traceId, key: `trace:${traceId}` };
     }
@@ -1270,11 +1289,13 @@ export class OtlpTraceFlusher extends BaseFlusher {
         try {
           const convert = agentType === 'qwen-code-cli' ? convertQwenSubagents
             : agentType === 'codex' ? convertCodexTurn
+            : agentType === 'doubao-work' ? convertDoubaoWorkTurn
             : (agentType === 'hermes' || agentType === 'openclaw') ? convertDelegatedTurn
             : convertEventLogToTrace;
           result = convert(
             sanitized as unknown as EventLogRecord[],
-            { handler, strict: false, passthroughKeys, idGenerator },
+            { handler, strict: false, passthroughKeys, idGenerator,
+              ...(agentType === 'doubao-work' ? { observationTracer: provider.getTracer('@loongsuite/pilot-doubao-local-observation') } : {}) },
           );
           succeeded = true;
         } finally {
@@ -1321,6 +1342,10 @@ export class OtlpTraceFlusher extends BaseFlusher {
       if (agentType === 'grok-build') {
         this.enrichGrokBuildSpans(records, spans, grokMetadata);
       }
+      if (agentType === 'doubao-work') {
+        this.enrichDoubaoWorkSpans(records, spans);
+        enrichDoubaoClientRequest(records, spans);
+      }
 
       spans = await this.spanEnrichers.enrich(spans, { agentType, serviceName });
       // Post-convert patch: the otel-util-genai converter auto-creates ENTRY
@@ -1345,6 +1370,37 @@ export class OtlpTraceFlusher extends BaseFlusher {
     } finally {
       convertState.active -= 1;
       this.evictConvertStates();
+    }
+  }
+
+  private enrichDoubaoWorkSpans(records: AgentActivityEntry[], spans: ReadableSpan[]): void {
+    const terminal = [...records].reverse().find(record => record['gen_ai.turn.end'] === true);
+    const outcome = terminal?.['loongsuite.doubao_work.client_outcome'];
+    const hasUpstreamParent = records.some(record => record['event.name'] === 'other'
+      && typeof record.parent_span_id === 'string'
+      && /^[0-9a-f]{16}$/.test(record.parent_span_id)
+      && !/^0+$/.test(record.parent_span_id));
+    for (const span of spans) {
+      const kind = span.attributes['gen_ai.span.kind'];
+      if (kind !== 'ENTRY' && kind !== 'AGENT') continue;
+      span.attributes['gen_ai.framework'] = 'doubao-work';
+      for (const key of ['loongsuite.doubao_work.selected_skills', 'loongsuite.doubao_work.selected_partners']) {
+        const values = terminal?.[key];
+        if (Array.isArray(values) && values.length <= 32 && values.every(value => typeof value === 'string' && /^[a-zA-Z0-9_.:-]{1,256}$/.test(value))) span.attributes[key] = values as string[];
+      }
+      // util beta.13 preserves trace_id via a virtual parent. A locally
+      // identified turn has no external parent; retain only explicit linking.
+      if (kind === 'ENTRY' && !hasUpstreamParent) {
+        Object.assign(span, { parentSpanId: undefined });
+      }
+      // A received reply (including capacity/entitlement notices) says nothing
+      // about business success. No native model finish reason is synthesized.
+      const failed = outcome === 'error' || outcome === 'cancelled';
+      Object.assign(span.status, { code: failed ? SpanStatusCode.ERROR : SpanStatusCode.UNSET });
+      if (failed) {
+        span.attributes['error.type'] = outcome === 'cancelled'
+          ? 'doubao.client_request_cancelled' : 'doubao.client_request_failed';
+      }
     }
   }
 
